@@ -47,6 +47,7 @@ async function boot(user) {
   const saved = localStorage.getItem('crm_page') || 'dashboard';
   navStack = [];
   navTo(saved, true);
+  restoreScriptFloat();
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ function buildTopbar() {
   q('#dash-actions').innerHTML = isAdmin()
     ? `<button class="btn btn-secondary btn-sm" onclick="navTo('users')">Users</button>` : '';
   q('#script-actions').innerHTML = isAdmin()
-    ? `<button class="btn btn-secondary btn-sm" onclick="openScriptEditModal()">Edit</button>` : '';
+    ? `<button class="btn btn-secondary btn-sm" onclick="openScriptEditModal()">Edit Script</button>` : '';
 }
 
 function navTo(page, replace = false) {
@@ -213,7 +214,7 @@ async function incrementProgress() {
     .upsert({ user_id: currentProfile.id, date: today, calls_done: done, goal: todayProgress.goal },
       { onConflict: 'user_id,date' }).select().single();
   if (data) todayProgress = data;
-  renderProgress();
+  renderProgress(true);  // animate new segment fill
 }
 
 async function setGoal(delta) {
@@ -223,7 +224,7 @@ async function setGoal(delta) {
     .upsert({ user_id: currentProfile.id, date: today, calls_done: todayProgress.calls_done || 0, goal: newGoal },
       { onConflict: 'user_id,date' }).select().single();
   if (data) todayProgress = data;
-  renderProgress();
+  renderProgress(false);
 }
 
 async function loadScript() {
@@ -264,11 +265,18 @@ function renderDashboard() {
   const active = allLeads.filter(l => l.status !== 'Closed Won' && l.status !== 'Not Interested');
   const overdue = active.filter(l => l.next_followup && l.next_followup < today);
   const dueToday = active.filter(l => l.next_followup === today);
-  const unscheduled = active.filter(l => !l.next_followup && l.status !== 'Appointment Set');
-  const wins = allLeads.filter(l => l.status === 'Appointment Set');
-  const winsToday = wins.filter(l => (l.updated_at || '').startsWith(today));
-  const winsThisMonth = wins.filter(l => (l.updated_at || '') >= thisMonth + 'T00:00:00');
+  const unscheduled = active.filter(l => !l.next_followup && l.status !== 'Booked');
+  const booked = allLeads.filter(l => l.status === 'Booked');
+  const bookedToday = booked.filter(l => (l.updated_at || '').startsWith(today));
+  const bookedMonth = booked.filter(l => (l.updated_at || '') >= thisMonth + 'T00:00:00');
 
+  // Aggregate est_commission from DB-stored values (null-safe)
+  const totalComm = booked.reduce((sum, l) => sum + (parseFloat(l.est_commission) || 0), 0);
+  const commDisplay = totalComm > 0
+    ? '$' + totalComm.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })
+    : '—';
+
+  // Card order: Total Leads | Due Today | Overdue | Booked Calls
   q('#stat-grid').innerHTML = `
     <div class="stat-card" onclick="navTo('leads')">
       <div class="stat-label">Total Leads</div>
@@ -277,18 +285,19 @@ function renderDashboard() {
     </div>
     <div class="stat-card" onclick="navTo('leads')">
       <div class="stat-label">Due Today</div>
-      <div class="stat-value" style="color:var(--yellow)">${dueToday.length}</div>
+      <div class="stat-value" style="color:#4ade80">${dueToday.length}</div>
       <div class="stat-sub">follow-ups today</div>
     </div>
     <div class="stat-card" onclick="navTo('leads')">
       <div class="stat-label">Overdue</div>
-      <div class="stat-value" style="color:var(--red)">${overdue.length}</div>
+      <div class="stat-value" style="color:var(--yellow)">${overdue.length}</div>
       <div class="stat-sub">${unscheduled.length} unscheduled</div>
     </div>
-    <div class="stat-card wins" onclick="navTo('leads')">
-      <div class="stat-label" style="color:var(--green)">🎯 Wins</div>
-      <div class="stat-value" style="color:var(--green)">${wins.length}</div>
-      <div class="stat-sub">${winsToday.length} today · ${winsThisMonth.length} this month</div>
+    <div class="stat-card" id="card-booked" onclick="navTo('leads')">
+      <div class="stat-label">🎯 Booked Calls</div>
+      <div class="stat-value" style="color:var(--green);font-size:30px;font-weight:700">${booked.length}</div>
+      <div class="stat-sub">${bookedToday.length} today · ${bookedMonth.length} this month</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:5px">Est. Commission: <span style="color:${totalComm > 0 ? 'var(--green)' : 'var(--muted)'};font-family:var(--mono);font-weight:600">${commDisplay}</span></div>
     </div>`;
 
   renderProgress();
@@ -310,22 +319,64 @@ function renderDashboard() {
   q('#queue-section').innerHTML = html;
 }
 
-function renderProgress() {
+function renderProgress(animate = false) {
   const done = todayProgress.calls_done || 0;
   const goal = todayProgress.goal || 20;
-  const pct = Math.min(100, Math.round(done / goal * 100));
-  const met = done >= goal;
-  const col = met ? 'var(--green)' : 'var(--accent)';
-  q('#progress-wrap').innerHTML = `
+  const SEGS = 10;
+  const segsPerCall = goal / SEGS;           // calls per segment
+  const filledSegs = Math.min(SEGS, Math.floor(done / segsPerCall));
+  const partialPct = ((done % segsPerCall) / segsPerCall) * 100;
+
+  // Color ramp: dark blue-gray → teal-green as progress grows
+  const segColor = (i) => {
+    if (i >= filledSegs) return null; // unfilled
+    const t = i / (SEGS - 1);  // 0 → 1
+    // Interpolate: #2a3a4a (cool dark) → #10b981 (emerald)
+    const r = Math.round(42 + (16 - 42) * t);
+    const g = Math.round(58 + (185 - 58) * t);
+    const b = Math.round(74 + (129 - 74) * t);
+    return `rgb(${r},${g},${b})`;
+  };
+
+  const helperText = done === 0 ? "Let's get started"
+    : done >= goal ? '🎯 Target hit'
+      : done >= goal * 0.8 ? 'Almost there'
+        : done >= goal * 0.4 ? 'Good pace'
+          : 'Building momentum';
+
+  const segsHTML = Array.from({ length: SEGS }, (_, i) => {
+    const color = segColor(i);
+    const isFilled = i < filledSegs;
+    const isNew = animate && i === filledSegs - 1;
+    return `<div class="prog-seg${isFilled ? ' filled' : ''}${isNew ? ' pop' : ''}" style="${isFilled ? `background:${color};border-color:${color}` : ''}"></div>`;
+  }).join('');
+
+  const numColor = done >= goal ? 'var(--green)' : done > 0 ? 'var(--teal)' : 'var(--muted)';
+
+  const el = q('#progress-wrap');
+  if (!el) return;
+  el.innerHTML = `
     <div class="progress-card">
-      <span class="prog-label">📞 Daily Calls</span>
-      <div class="prog-bar-bg"><div class="prog-bar" style="width:${pct}%;background:${col}"></div></div>
-      <span class="prog-nums" style="color:${col}">${done}/${goal}</span>
-      <div class="goal-controls">
-        <button class="btn btn-ghost btn-sm" onclick="setGoal(-5)" title="Lower goal" style="padding:4px 8px;font-size:15px">−</button>
-        <button class="btn btn-ghost btn-sm" onclick="setGoal(5)"  title="Raise goal" style="padding:4px 8px;font-size:15px">+</button>
+      <div class="prog-header">
+        <span class="prog-label">📞 Daily Calls</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="prog-nums" style="color:${numColor}">${done}<span style="font-size:13px;color:var(--muted)">/${goal}</span></span>
+          <button class="btn btn-ghost btn-sm" onclick="setGoal(-5)" title="Lower goal" style="padding:3px 7px;font-size:14px">−</button>
+          <button class="btn btn-ghost btn-sm" onclick="setGoal(5)"  title="Raise goal" style="padding:3px 7px;font-size:14px">+</button>
+        </div>
+      </div>
+      <div class="prog-segs">${segsHTML}</div>
+      <div class="prog-helper">
+        <span>${helperText}</span>
       </div>
     </div>`;
+
+  // Milestone pulse on the whole card at 5, 10, 20
+  if (animate && (done === 5 || done === 10 || done === goal)) {
+    const card = el.querySelector('.progress-card');
+    card?.classList.add('prog-milestone');
+    setTimeout(() => card?.classList.remove('prog-milestone'), 600);
+  }
 }
 
 function qCard(l) {
@@ -343,11 +394,11 @@ function qCard(l) {
   </div>`;
 }
 
-// ─── LEADS TABLE + MOBILE CARDS ───────────────────────────────
 // Inline quick-disposition buttons (subset of OUTCOMES for one-tap use)
+// OUTCOMES indices: 0=No Answer, 1=Left VM, 2=Gatekeeper, 3=Called, 4=Booked, 5=Not Int., 6=Follow Up
 const QUICK_BTNS = [
   { label: 'No Ans', idx: 0, style: 'background:var(--surface2);color:var(--dim);border-color:var(--border2)' },
-  { label: 'VM', idx: 1, style: 'background:#1a2640;color:#60a5fa;border-color:#1e40af' },
+  { label: 'Left VM', idx: 1, style: 'background:#1a2640;color:#60a5fa;border-color:#1e40af' },
   { label: 'GK', idx: 2, style: 'background:#1f1535;color:#c084fc;border-color:#6b21a8' },
   { label: 'Not Int', idx: 5, style: 'background:var(--red-dim);color:var(--red);border-color:#7f1d1d' },
   { label: 'Booked', idx: 4, style: 'background:var(--teal-dim);color:var(--teal);border-color:#0f766e' },
@@ -455,7 +506,7 @@ function renderLeads() {
 }
 
 // ─── LEAD MODAL ───────────────────────────────────────────────
-const STATUSES = ['New', 'Trying to Reach', 'Connected', 'Follow Up', 'Not Interested', 'Closed Won', 'Appointment Set'];
+// STATUSES defined above near OUTCOMES — using same canonical DB values
 
 function openLeadModal(id) {
   const lead = id ? allLeads.find(l => l.id === id) : null;
@@ -488,12 +539,22 @@ function openLeadModal(id) {
     <div class="fg"><label>Next Step</label><input class="fi" id="lm-next-step" placeholder="e.g. Call back Thursday, email proposal…" value="${esc(lead?.next_step || '')}"></div>
     <div class="fg"><label>Notes</label><textarea class="fi" id="lm-notes" rows="3">${esc(lead?.notes || '')}</textarea></div>
     ${lead ? `
-    <div style="margin-top:8px;padding-top:10px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;user-select:none">
-        <input type="checkbox" id="lm-link-sent" ${lead.booking_link_sent ? 'checked' : ''} style="accent-color:var(--accent)">
-        Booking link sent
-      </label>
-      ${lead.booked_at ? `<span style="font-size:11px;color:var(--green);font-family:var(--mono)">✓ Booked ${new Date(lead.booked_at).toLocaleDateString()}</span>` : ''}
+    <div style="margin-top:8px;padding-top:10px;border-top:1px solid var(--border)">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;user-select:none">
+          <input type="checkbox" id="lm-link-sent" ${lead.booking_link_sent ? 'checked' : ''} style="accent-color:var(--accent)">
+          Booking link sent
+        </label>
+        ${lead.booked_at ? `<span style="font-size:11px;color:var(--green);font-family:var(--mono)">✓ Booked ${new Date(lead.booked_at).toLocaleDateString()}</span>` : ''}
+      </div>
+      <div class="fg" style="margin-bottom:0">
+        <label>Est. Monthly Bill <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:10px">(optional — used to calc commission)</span></label>
+        <div style="position:relative">
+          <span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted);font-family:var(--mono);font-size:13px">$</span>
+          <input class="fi" type="number" id="lm-est-bill" min="0" step="100" placeholder="e.g. 4000" value="${lead.est_monthly_bill || ''}" style="padding-left:22px">
+        </div>
+        ${lead.est_monthly_bill ? `<div style="font-size:11px;color:var(--muted);margin-top:3px">Est. commission: <span style="color:var(--green);font-family:var(--mono)">${'$' + (lead.est_monthly_bill * 0.025).toLocaleString('en-US', { maximumFractionDigits: 0 })}</span></div>` : ''}
+      </div>
     </div>
     <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:12px">
       <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px">Call History</div>
@@ -508,7 +569,23 @@ function openLeadModal(id) {
     <button class="btn btn-primary" onclick="saveLead(${lead ? `'${lead.id}'` : 'null'})">${isNew ? 'Add Lead' : 'Save'}</button>`;
   q('#lead-modal').classList.add('open');
   if (lead) loadCallLogs(lead.id);
-}
+  // Live commission preview as user types the bill amount
+  const billInput = q('#lm-est-bill');
+  if (billInput) {
+    billInput.addEventListener('input', () => {
+      const val = parseFloat(billInput.value) || 0;
+      let preview = billInput.parentElement?.nextElementSibling;
+      if (!preview) {
+        preview = document.createElement('div');
+        preview.style.cssText = 'font-size:11px;color:var(--muted);margin-top:3px';
+        billInput.parentElement.after(preview);
+      }
+      preview.innerHTML = val > 0
+        ? `Est. commission: <span style="color:var(--green);font-family:var(--mono)">$${(val * 0.025).toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>`
+        : '';
+    });
+  }
+}  // end openLeadModal
 
 async function loadCallLogs(leadId) {
   const { data } = await sb.from('call_logs')
@@ -594,10 +671,10 @@ async function deleteCallLog(logId, leadId, isLatest) {
   if (isLatest) {
     if (log.prev_status) restore.status = log.prev_status;
     if (log.prev_followup !== undefined) restore.next_followup = log.prev_followup || null;
-    if (log.outcome === 'Appointment Set') restore.booked_at = log.prev_booked_at || null;
+    if (log.outcome === 'Booked') restore.booked_at = log.prev_booked_at || null;
   }
   // Even for non-latest: if this was a win entry, clear booked_at
-  if (!isLatest && log.outcome === 'Appointment Set') {
+  if (!isLatest && log.outcome === 'Booked') {
     restore.booked_at = null;
   }
   await sb.from('leads').update(restore).eq('id', leadId);
@@ -655,10 +732,15 @@ async function saveLead(id) {
     booking_link_sent: q('#lm-link-sent')?.checked || false,
     last_activity_at: new Date().toISOString(),
   };
-  // Auto-set booked_at when status becomes Appointment Set
+  // Compute and persist est_commission whenever est_monthly_bill is set
+  const rawBill = q('#lm-est-bill')?.value;
+  const bill = rawBill ? parseFloat(rawBill) : null;
+  payload.est_monthly_bill = bill;
+  payload.est_commission = bill != null ? Math.round(bill * 0.025 * 100) / 100 : null;
+  // Auto-set booked_at when status becomes Booked
   if (id) {
     const prev = allLeads.find(l => l.id === id);
-    if (payload.status === 'Appointment Set' && prev?.status !== 'Appointment Set') {
+    if (payload.status === 'Booked' && prev?.status !== 'Booked') {
       payload.booked_at = new Date().toISOString();
     }
   }
@@ -667,6 +749,7 @@ async function saveLead(id) {
     payload.uploaded_by = currentUser.id;
     if (!payload.assigned_to) payload.assigned_to = currentProfile.id;
   }
+  console.log('[saveLead] writing status:', JSON.stringify(payload.status), '| est_commission:', payload.est_commission);
   const { error } = id
     ? await sb.from('leads').update(payload).eq('id', id)
     : await sb.from('leads').insert(payload);
@@ -735,14 +818,39 @@ async function deleteLead(id) {
 }
 
 // ─── QUICK LOG ────────────────────────────────────────────────
+// ─── VALID STATUS VALUES (must match DB check constraint exactly) ─────────────
+// DB allows: 'New', 'Trying To Reach', 'Called', 'Left VM',
+//            'Not Interested', 'Follow Up', 'Booked'
+const STATUSES = ['New', 'Trying To Reach', 'Called', 'Left VM', 'Not Interested', 'Follow Up', 'Booked'];
+
+// Canonical DB status mapper — use this everywhere a status string is written to Supabase
+function toDbStatus(s) {
+  if (!s) return 'New';
+  const map = {
+    // Old values → new DB values
+    'trying to reach': 'Trying To Reach',
+    'connected': 'Called',
+    'follow up': 'Follow Up',
+    'not interested': 'Not Interested',
+    'closed won': 'Booked',
+    'appointment set': 'Booked',
+    // Already-correct values (lowercase match)
+    'new': 'New',
+    'called': 'Called',
+    'left vm': 'Left VM',
+    'booked': 'Booked',
+  };
+  return map[s.toLowerCase().trim()] || s;
+}
+
 const OUTCOMES = [
-  { label: 'No Answer', outcome: 'No Answer', status: 'Trying to Reach', days: 1, color: 'var(--surface2)', tc: 'var(--dim)' },
-  { label: 'Voicemail', outcome: 'VM', status: 'Trying to Reach', days: 2, color: '#1a2640', tc: '#60a5fa' },
-  { label: 'Gatekeeper', outcome: 'Gatekeeper', status: 'Trying to Reach', days: 1, color: '#1f1535', tc: '#c084fc' },
-  { label: 'Decision Maker', outcome: 'Spoke', status: 'Connected', days: 3, color: 'var(--green-dim)', tc: 'var(--green)' },
-  { label: 'Appointment Set', outcome: 'Appointment Set', status: 'Appointment Set', days: null, color: 'var(--teal-dim)', tc: 'var(--teal)' },
-  { label: 'Not Interested', outcome: 'Not Interested', status: 'Not Interested', days: null, color: 'var(--red-dim)', tc: 'var(--red)' },
-  { label: 'Call Back Later', outcome: 'Other', status: 'Follow Up', days: 5, color: 'var(--yellow-dim)', tc: 'var(--yellow)' },
+  { label: 'No Answer', outcome: 'No Answer', status: 'Trying To Reach', days: 1, color: 'var(--surface2)', tc: 'var(--dim)' },
+  { label: 'Left VM', outcome: 'Left VM', status: 'Left VM', days: 2, color: '#1a2640', tc: '#60a5fa' },
+  { label: 'Gatekeeper', outcome: 'Gatekeeper', status: 'Trying To Reach', days: 1, color: '#1f1535', tc: '#c084fc' },
+  { label: 'Called', outcome: 'Called', status: 'Called', days: 3, color: 'var(--green-dim)', tc: 'var(--green)' },
+  { label: 'Booked', outcome: 'Booked', status: 'Booked', days: null, color: 'var(--teal-dim)', tc: 'var(--teal)' },
+  { label: 'Not Int.', outcome: 'Not Interested', status: 'Not Interested', days: null, color: 'var(--red-dim)', tc: 'var(--red)' },
+  { label: 'Follow Up', outcome: 'Follow Up', status: 'Follow Up', days: 5, color: 'var(--yellow-dim)', tc: 'var(--yellow)' },
 ];
 
 let activePopup = null;
@@ -800,14 +908,17 @@ async function doQuickLog(leadId, idx) {
     d.setDate(d.getDate() + o.days);
     nextFollowup = d.toISOString().split('T')[0];
   }
+
   const updates = { status: o.status, last_contact: today, last_activity_at: new Date().toISOString() };
   if (nextFollowup) updates.next_followup = nextFollowup;
-  // Auto-set booked_at when marking Appointment Set
-  if (o.status === 'Appointment Set' && lead?.status !== 'Appointment Set') {
-    updates.booked_at = new Date().toISOString();
-  }
 
-  // Snapshot previous state so undo can restore it
+  // Auto-set booked_at when marking Booked
+  const isBooking = o.status === 'Booked' && lead?.status !== 'Booked';
+  if (isBooking) updates.booked_at = new Date().toISOString();
+
+  // DEBUG — visible in browser console so you can verify exact value sent
+  console.log('[doQuickLog] leadId:', leadId, '| writing status:', JSON.stringify(updates.status), '| full updates:', updates);
+
   const logEntry = {
     lead_id: leadId,
     user_id: currentUser.id,
@@ -822,8 +933,13 @@ async function doQuickLog(leadId, idx) {
     sb.from('leads').update(updates).eq('id', leadId),
     sb.from('call_logs').insert(logEntry),
   ]);
+
+  console.log('[doQuickLog] update result:', upd.error ? 'ERROR: ' + upd.error.message : 'OK');
   if (upd.error) { toast('❌ ' + upd.error.message); return; }
-  toast('✓ ' + o.label);
+
+  toast(isBooking ? '🎯 Call booked!' : '✓ ' + o.label);
+  if (isBooking) { pulseBookedCard(); launchConfetti(); }
+
   await Promise.all([incrementProgress(), loadLeads()]);
   renderDashboard();
   if (currentPage === 'leads') renderLeads();
@@ -884,14 +1000,223 @@ function renderScript() {
   q('#script-view').innerHTML = buildScriptHTML(currentScript, 'scp');
 }
 
-function openScriptQuick() {
-  const sqm = q('#script-quick-modal');
-  q('#sqm-title').textContent = currentScript?.name || 'Call Script';
-  q('#sqm-body').innerHTML = buildScriptHTML(currentScript, 'sqm');
-  q('#sqm-edit-btn').style.display = isAdmin() ? '' : 'none';
-  sqm.classList.add('open');
+function openScriptQuick() { openScriptPanel(); }  // legacy alias
+function closeScriptQuick() { closeScriptPanel(); } // legacy alias
+
+// ─── FLOATING SCRIPT PANEL ────────────────────────────────────
+const SF_KEY = 'crm_script_float';
+let _sfDragging = false, _sfResizing = false;
+
+function scriptFloatState() {
+  try { return JSON.parse(localStorage.getItem(SF_KEY) || '{}'); } catch { return {}; }
 }
-function closeScriptQuick() { q('#script-quick-modal').classList.remove('open'); }
+function saveScriptFloatState(patch) {
+  const s = { ...scriptFloatState(), ...patch };
+  localStorage.setItem(SF_KEY, JSON.stringify(s));
+}
+
+function openScriptPanel() {
+  if (window.innerWidth <= 680) { openScriptSheet(); return; }
+  openScriptFloat();
+}
+function closeScriptPanel() {
+  closeScriptFloat(); closeScriptSheet();
+}
+
+function openScriptFloat() {
+  const panel = q('#script-float');
+  const mini = q('#script-mini');
+  if (!panel) return;
+  const s = scriptFloatState();
+  panel.style.width = (s.w || 380) + 'px';
+  panel.style.height = (s.h || 420) + 'px';
+  panel.style.left = (s.x || Math.max(20, window.innerWidth - 420)) + 'px';
+  panel.style.top = (s.y || 80) + 'px';
+  panel.classList.add('open');
+  if (mini) mini.style.display = 'none';
+  q('#sf-edit-btn').style.display = isAdmin() ? '' : 'none';
+  refreshScriptFloatBody();
+  saveScriptFloatState({ open: true, minimized: false });
+}
+
+function closeScriptFloat() {
+  q('#script-float')?.classList.remove('open');
+  q('#script-mini').style.display = 'none';
+  saveScriptFloatState({ open: false, minimized: false });
+}
+
+function minimizeScriptFloat() {
+  q('#script-float')?.classList.remove('open');
+  const mini = q('#script-mini');
+  if (mini) mini.style.display = 'inline-flex';
+  saveScriptFloatState({ minimized: true });
+}
+
+function refreshScriptFloatBody() {
+  const body = q('#script-float-body');
+  if (body) body.innerHTML = buildScriptHTML(currentScript, 'sf');
+}
+
+// Drag
+(function () {
+  let ox, oy, sx, sy;
+  document.addEventListener('mousedown', e => {
+    const hdr = e.target.closest('#script-float-header');
+    if (!hdr) return;
+    _sfDragging = true;
+    const panel = q('#script-float');
+    const r = panel.getBoundingClientRect();
+    ox = e.clientX - r.left; oy = e.clientY - r.top;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!_sfDragging) return;
+    const panel = q('#script-float');
+    const x = Math.max(0, Math.min(window.innerWidth - 100, e.clientX - ox));
+    const y = Math.max(0, Math.min(window.innerHeight - 50, e.clientY - oy));
+    panel.style.left = x + 'px'; panel.style.top = y + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!_sfDragging) return;
+    _sfDragging = false;
+    const panel = q('#script-float');
+    if (panel) saveScriptFloatState({ x: parseInt(panel.style.left), y: parseInt(panel.style.top) });
+  });
+})();
+
+// Resize
+(function () {
+  let startX, startY, startW, startH;
+  const getRz = () => q('#script-float-resize');
+  document.addEventListener('mousedown', e => {
+    if (!e.target.closest('#script-float-resize')) return;
+    _sfResizing = true;
+    const panel = q('#script-float');
+    const r = panel.getBoundingClientRect();
+    startX = e.clientX; startY = e.clientY;
+    startW = r.width; startH = r.height;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!_sfResizing) return;
+    const panel = q('#script-float');
+    const w = Math.max(280, startW + (e.clientX - startX));
+    const h = Math.max(180, startH + (e.clientY - startY));
+    panel.style.width = w + 'px'; panel.style.height = h + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!_sfResizing) return;
+    _sfResizing = false;
+    const panel = q('#script-float');
+    if (panel) saveScriptFloatState({ w: parseInt(panel.style.width), h: parseInt(panel.style.height) });
+  });
+})();
+
+// ─── MOBILE SCRIPT SHEET ──────────────────────────────────────
+let _sheetExpanded = false;
+
+function openScriptSheet() {
+  const sheet = q('#script-sheet');
+  const bd = q('#script-sheet-backdrop');
+  if (!sheet) return;
+  sheet.classList.add('open');
+  bd?.classList.add('open');
+  _sheetExpanded = true;
+  q('#script-sheet-arrow').textContent = '▼';
+  q('#ss-edit-btn').style.display = isAdmin() ? '' : 'none';
+  const body = q('#script-sheet-body');
+  if (body) body.innerHTML = buildScriptHTML(currentScript, 'ss');
+}
+
+function closeScriptSheet() {
+  q('#script-sheet')?.classList.remove('open');
+  q('#script-sheet-backdrop')?.classList.remove('open');
+  _sheetExpanded = false;
+}
+
+function toggleScriptSheet() {
+  if (_sheetExpanded) closeScriptSheet(); else openScriptSheet();
+}
+
+// Touch drag on sheet handle to resize height
+(function () {
+  let startY, startH;
+  const getHandle = () => q('#script-sheet-drag-bar');
+  document.addEventListener('touchstart', e => {
+    if (!e.target.closest('#script-sheet-drag-bar')) return;
+    startY = e.touches[0].clientY;
+    startH = q('#script-sheet')?.getBoundingClientRect().height || 300;
+  }, { passive: true });
+  document.addEventListener('touchmove', e => {
+    if (startY === undefined) return;
+    const sheet = q('#script-sheet');
+    if (!sheet) return;
+    const dy = startY - e.touches[0].clientY;
+    const h = Math.max(120, Math.min(window.innerHeight * 0.85, startH + dy));
+    sheet.style.maxHeight = h + 'px';
+  }, { passive: true });
+  document.addEventListener('touchend', () => { startY = undefined; });
+})();
+
+// ─── CONFETTI ─────────────────────────────────────────────────
+function launchConfetti() {
+  const canvas = q('#confetti-canvas');
+  if (!canvas) return;
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  canvas.style.display = 'block';
+  const ctx = canvas.getContext('2d');
+  const pieces = Array.from({ length: 60 }, () => ({
+    x: Math.random() * canvas.width,
+    y: -10 - Math.random() * 40,
+    r: 3 + Math.random() * 4,
+    vx: (Math.random() - 0.5) * 3,
+    vy: 2 + Math.random() * 3,
+    color: ['#22c55e', '#2dd4bf', '#4f8aff', '#c9980a', '#a855f7'][Math.floor(Math.random() * 5)],
+    angle: Math.random() * Math.PI * 2,
+    spin: (Math.random() - 0.5) * 0.2,
+    life: 1,
+  }));
+  let frame;
+  function tick() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    let alive = false;
+    for (const p of pieces) {
+      p.x += p.vx; p.y += p.vy; p.vy += 0.08;
+      p.angle += p.spin; p.life -= 0.018;
+      if (p.life <= 0 || p.y > canvas.height) continue;
+      alive = true;
+      ctx.save(); ctx.globalAlpha = p.life;
+      ctx.translate(p.x, p.y); ctx.rotate(p.angle);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.r, -p.r / 2, p.r * 2, p.r);
+      ctx.restore();
+    }
+    if (alive) { frame = requestAnimationFrame(tick); }
+    else { canvas.style.display = 'none'; cancelAnimationFrame(frame); }
+  }
+  tick();
+}
+
+function pulseBookedCard() {
+  const card = q('#card-booked');
+  if (!card) return;
+  card.classList.remove('booked-pulse');
+  void card.offsetWidth; // force reflow
+  card.classList.add('booked-pulse');
+  setTimeout(() => card.classList.remove('booked-pulse'), 900);
+}
+
+// Restore script panel on boot if it was open
+function restoreScriptFloat() {
+  if (window.innerWidth <= 680) return;
+  const s = scriptFloatState();
+  if (s.open && !s.minimized) openScriptFloat();
+  else if (s.minimized) {
+    const mini = q('#script-mini');
+    if (mini) mini.style.display = 'inline-flex';
+  }
+}
 
 function openScriptEditModal() {
   if (!currentScript) return;
@@ -921,6 +1246,7 @@ async function saveScript() {
   closeScriptEditModal();
   await loadScript();
   renderScript();
+  refreshScriptFloatBody();  // update float panel if open
   toast('✓ Script saved');
 }
 
@@ -937,7 +1263,7 @@ async function renderUsers() {
     const ul = allLeads.filter(l => l.assigned_to === u.id);
     const due = ul.filter(l => l.next_followup === today).length;
     const od = ul.filter(l => l.next_followup && l.next_followup < today && l.status !== 'Closed Won').length;
-    const wins = ul.filter(l => l.status === 'Appointment Set' && (l.updated_at || '') >= thisMonth + 'T00:00:00').length;
+    const wins = ul.filter(l => l.status === 'Booked' && (l.updated_at || '') >= thisMonth + 'T00:00:00').length;
     const calls = progMap[u.id] || 0;
     return `<tr>
       <td><div style="font-weight:600">${esc(u.full_name || '—')}</div><div style="font-size:11px;color:var(--muted)">${esc(u.email)}</div></td>
@@ -968,12 +1294,13 @@ function normSt(v) {
   if (!v) return 'New';
   const lv = v.toLowerCase().trim();
   if (lv === 'not called' || lv === 'new') return 'New';
-  if (lv.includes('appointment') || lv.includes('booked')) return 'Appointment Set';
+  if (lv.includes('appointment') || lv === 'booked') return 'Booked';
   if (lv.includes('not interested')) return 'Not Interested';
-  if (lv.includes('closed') || lv.includes('won')) return 'Closed Won';
+  if (lv.includes('closed') || lv.includes('won')) return 'Booked';
   if (lv.includes('follow')) return 'Follow Up';
-  if (lv.includes('connect') || lv.includes('spoke')) return 'Connected';
-  if (lv.includes('try') || lv.includes('reach')) return 'Trying to Reach';
+  if (lv === 'left vm' || lv.includes('voicemail') || lv.includes('vm')) return 'Left VM';
+  if (lv.includes('connect') || lv.includes('spoke') || lv === 'called') return 'Called';
+  if (lv.includes('try') || lv.includes('reach')) return 'Trying To Reach';
   return 'New';
 }
 function normDt(v) {
@@ -1141,9 +1468,15 @@ function closeInviteModal() { q('#invite-modal').classList.remove('open'); }
 // ─── BADGE ────────────────────────────────────────────────────
 function statusBadge(s) {
   const m = {
-    'New': 'b-new', 'Trying to Reach': 'b-try', 'Connected': 'b-conn',
-    'Follow Up': 'b-follow', 'Not Interested': 'b-notint', 'Closed Won': 'b-won',
-    'Appointment Set': 'b-appt',
+    'New': 'b-new',
+    'Trying To Reach': 'b-try', 'Trying to Reach': 'b-try',
+    'Called': 'b-conn', 'Connected': 'b-conn',
+    'Left VM': 'b-try',
+    'Follow Up': 'b-follow',
+    'Not Interested': 'b-notint',
+    'Closed Won': 'b-won',
+    'Booked': 'b-appt', 'Appointment Set': 'b-appt',
+    // call log outcomes
     'No Answer': 'b-new', 'VM': 'b-try', 'Gatekeeper': 'b-follow',
     'Spoke': 'b-conn', 'Other': 'b-follow',
   };
